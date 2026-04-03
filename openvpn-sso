@@ -1,0 +1,666 @@
+#!/usr/bin/env bash
+#
+# openvpn-sso — OpenVPN CLI wrapper with SAML/SSO auth + split-DNS for macOS
+#
+# Transparent wrapper: all openvpn flags are supported and passed through.
+# Adds SAML browser auth, split-DNS, background mode, and multi-tunnel support.
+#
+set -euo pipefail
+
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GVPN_HOME="${HOME}/.openvpn-sso"
+CONFIGS_DIR="${GVPN_HOME}/configs"
+RUN_DIR="${GVPN_HOME}/sessions"
+SUDOERS_FILE="/etc/sudoers.d/openvpn-sso"
+OPENVPN_BIN="$(command -v openvpn 2>/dev/null || echo "")"
+
+# ── Preflight: check dependencies ──
+if [[ -z "$OPENVPN_BIN" ]]; then
+    echo "Error: openvpn not found. Install with:"
+    echo "  brew install openvpn"
+    echo ""
+    echo "Then add to your PATH:"
+    echo "  echo 'export PATH=\"/opt/homebrew/opt/openvpn/sbin:\$PATH\"' >> ~/.zshrc"
+    exit 1
+fi
+
+mkdir -p "$RUN_DIR" "$CONFIGS_DIR"
+
+# ── Helpers ──
+tunnel_name_from_config() { basename "$1" .ovpn | tr ' .@' '---'; }
+tunnel_log()     { echo "$RUN_DIR/$1.log"; }
+tunnel_pid()     { echo "$RUN_DIR/$1.pid"; }
+tunnel_dns_key() { echo "State:/Network/Service/VPN-$1/DNS"; }
+tunnel_config()  { echo "$RUN_DIR/$1-cleaned.ovpn"; }
+
+tunnel_state() {
+    local logfile="$1"
+    local pidfile="$2"
+
+    # First check: is the process even running?
+    if [[ -f "$pidfile" ]]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if ! ps -p "$pid" >/dev/null 2>&1; then
+            echo "DEAD"; return
+        fi
+    else
+        echo "DEAD"; return
+    fi
+
+    # Process is running — check log for latest state
+    # Use the LAST occurrence of key markers (log is append-only, may have multiple sessions)
+    local last_lines
+    last_lines=$(tail -50 "$logfile" 2>/dev/null || true)
+
+    # Check for disconnect/failure signals in recent log
+    if echo "$last_lines" | grep -qE '(SIGTERM|process exiting|AUTH_FAILED|Connection reset|Inactivity timeout)'; then
+        echo "DISCONNECTED"; return
+    fi
+
+    if grep -q 'Initialization Sequence Completed' "$logfile" 2>/dev/null; then
+        # Verify the interface still exists AND its IP matches what this tunnel was assigned
+        local utun assigned_ip actual_ip
+        utun=$(grep -oE 'utun[0-9]+' "$logfile" 2>/dev/null | tail -1 || true)
+        assigned_ip=$(grep -oE 'ifconfig [a-z0-9]+ [0-9.]+' "$logfile" 2>/dev/null | tail -1 | awk '{print $3}' || true)
+        if [[ -n "$utun" ]]; then
+            actual_ip=$(ifconfig "$utun" 2>/dev/null | grep 'inet ' | awk '{print $2}' || true)
+            if [[ -z "$actual_ip" ]]; then
+                echo "DISCONNECTED"; return
+            fi
+            # If the interface IP doesn't match what THIS tunnel was assigned,
+            # another tunnel took over the interface
+            if [[ -n "$assigned_ip" && "$actual_ip" != "$assigned_ip" ]]; then
+                echo "DISCONNECTED"; return
+            fi
+        fi
+        # Also check if openvpn is still doing keepalives (no ping timeout)
+        local last_ping
+        last_ping=$(grep -c 'ping-restart' "$logfile" 2>/dev/null || true)
+        local last_completed
+        last_completed=$(grep -c 'Initialization Sequence Completed' "$logfile" 2>/dev/null || true)
+        # If ping-restart appeared AFTER connection, tunnel is dead
+        if [[ "$last_ping" -gt 0 ]]; then
+            local last_ping_line last_completed_line
+            last_ping_line=$(grep -n 'ping-restart' "$logfile" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+            last_completed_line=$(grep -n 'Initialization Sequence Completed' "$logfile" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+            if [[ -n "$last_ping_line" && -n "$last_completed_line" && "$last_ping_line" -gt "$last_completed_line" ]]; then
+                echo "DISCONNECTED"; return
+            fi
+        fi
+        echo "CONNECTED"
+    elif grep -q 'AUTH_FAILED' "$logfile" 2>/dev/null; then echo "AUTH FAILED"
+    elif grep -q 'WEB_AUTH' "$logfile" 2>/dev/null; then
+        if grep -q 'PUSH_REPLY' "$logfile" 2>/dev/null; then echo "AUTHENTICATING"
+        else echo "WAITING FOR BROWSER"; fi
+    elif grep -q 'TLS: Initial packet' "$logfile" 2>/dev/null; then echo "TLS HANDSHAKE"
+    elif grep -q 'UDPv4 link remote' "$logfile" 2>/dev/null; then echo "CONNECTING"
+    else echo "STARTING"; fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMMANDS THAT DON'T NEED ROOT (run as current user)
+GVPN_VERSION="0.1.0"
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── No args = status ──
+if [[ $# -eq 0 ]]; then set -- "--status"; fi
+
+# ── Version ──
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then echo "openvpn-sso $GVPN_VERSION"; exit 0; fi
+
+# ── Help ──
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cat <<'HELP'
+NAME
+    openvpn-sso — OpenVPN wrapper with SAML/SSO auth and split-DNS for macOS
+
+SYNOPSIS
+    openvpn-sso -c <name|file> [openvpn-options...]
+    openvpn-sso -l [name]
+    openvpn-sso -d [name]
+    openvpn-sso --log [name] [--tail [N]] [-f]
+    openvpn-sso -i
+
+COMMANDS
+    -c, --config, --connect <name|file>
+        Connect to a VPN. Accepts a config name (looked up in
+        ~/.openvpn-sso/configs/) or a path to an .ovpn file.
+        All additional flags are passed through to openvpn.
+
+    -l, --status, --list
+        Show all available configs and their connection status.
+
+    -d, --disconnect, --cleanup [name]
+        Disconnect a tunnel by name, or all tunnels if no name given.
+
+    --log [name] [--tail [N]] [--follow|-f]
+        Show the full log for a tunnel. Defaults to the most recent.
+        --tail N    Show last N lines (default 50).
+        --follow    Follow log in real-time (like tail -f). -f for short.
+
+    -i, --install
+        One-time setup: configure passwordless sudo and create
+        /usr/local/bin/openvpn-sso symlink for global access.
+
+    --uninstall
+        Remove passwordless sudo configuration.
+
+OPTIONS
+    --fg, --foreground
+        Run in foreground with live openvpn output. Default is background.
+
+    -h, --help
+        Show this help.
+
+FILES
+    ~/.openvpn-sso/configs/    Connection profiles (.ovpn files)
+    ~/.openvpn-sso/sessions/   Runtime state (PIDs, logs, cleaned configs)
+
+EXAMPLES
+    openvpn-sso -c client                  Connect using ~/.openvpn-sso/configs/client.ovpn
+    openvpn-sso -c il --fg                 Connect with live output
+    openvpn-sso -c client --remote 1.2.3.4 1194    Override remote server
+    openvpn-sso -l                         Show all connections
+    openvpn-sso -d il                      Disconnect the 'il' tunnel
+    openvpn-sso -d                         Disconnect all tunnels
+HELP
+    exit 0
+fi
+
+# ── Install ──
+if [[ "${1:-}" == "--install" || "${1:-}" == "-i" ]]; then
+    echo "[*] Configuring passwordless sudo for openvpn-sso..."
+    sudo tee "$SUDOERS_FILE" > /dev/null <<EOF
+$USER ALL=(ALL) NOPASSWD: $SCRIPT_PATH
+$USER ALL=(ALL) NOPASSWD: $OPENVPN_BIN
+$USER ALL=(ALL) NOPASSWD: /usr/sbin/scutil
+$USER ALL=(ALL) NOPASSWD: /usr/bin/dscacheutil
+$USER ALL=(ALL) NOPASSWD: /usr/bin/killall
+$USER ALL=(ALL) NOPASSWD: /sbin/route
+EOF
+    sudo chmod 0440 "$SUDOERS_FILE"
+    if sudo visudo -c -f "$SUDOERS_FILE" 2>/dev/null; then
+        echo "[*] Passwordless sudo configured."
+    else
+        echo "[!] Sudoers syntax error — removing."
+        sudo rm -f "$SUDOERS_FILE"; exit 1
+    fi
+
+    # Create symlink in PATH so openvpn-sso is available everywhere
+    sudo ln -sf "$SCRIPT_PATH" /usr/local/bin/openvpn-sso
+    echo "[*] Symlink created: /usr/local/bin/openvpn-sso → $SCRIPT_PATH"
+
+    echo "[*] Done. Run 'openvpn-sso --help' from anywhere."
+    exit 0
+fi
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+    sudo rm -f "$SUDOERS_FILE" /usr/local/bin/openvpn-sso
+    echo "[*] Removed sudoers and symlink."
+    exit 0
+fi
+
+# ── Status / List (no root needed — just reads files) ──
+if [[ "${1:-}" == "--status" || "${1:-}" == "--list" || "${1:-}" == "-l" ]]; then
+    filter="${2:-}"
+    found=false
+    shown_names=""
+
+    # Show all configs from ~/.openvpn-sso/configs/
+    for f in "$CONFIGS_DIR"/*.ovpn; do
+        [[ -f "$f" ]] || continue
+        name=$(basename "$f" .ovpn)
+        tname=$(tunnel_name_from_config "$f")
+        if [[ -n "$filter" && "$tname" != "$filter" ]]; then continue; fi
+
+        pidfile=$(tunnel_pid "$tname")
+        logfile=$(tunnel_log "$tname")
+
+        # Remote from config
+        remote_host=$(grep -E '^remote ' "$f" 2>/dev/null | head -1 | awk '{print $2}' || true)
+        remote_port=$(grep -E '^remote ' "$f" 2>/dev/null | head -1 | awk '{print $3}' || true)
+        remote=""
+        if [[ -n "$remote_host" && -n "$remote_port" ]]; then remote="${remote_host}:${remote_port}"
+        elif [[ -n "$remote_host" ]]; then remote="$remote_host"; fi
+
+        # State
+        state="-"
+        if [[ -f "$logfile" ]]; then
+            state=$(tunnel_state "$logfile" "$pidfile")
+        fi
+
+        echo "[*] $name"
+        if [[ -n "$remote" ]]; then echo "    Remote:    $remote"; fi
+        echo "    State:     $state"
+
+        if [[ -f "$pidfile" ]]; then
+            pid=$(cat "$pidfile")
+            echo "    PID:       $pid"
+        fi
+
+        if [[ "$state" == "CONNECTED" ]]; then
+            utun=$(grep -oE 'utun[0-9]+' "$logfile" 2>/dev/null | tail -1 || true)
+            vpn_ip=""
+            if [[ -n "${utun:-}" ]]; then vpn_ip=$(ifconfig "$utun" 2>/dev/null | grep 'inet ' | awk '{print $2}' || true); fi
+            if [[ -n "${utun:-}" ]]; then echo "    Interface: $utun"; fi
+            if [[ -n "${vpn_ip:-}" ]]; then echo "    VPN IP:    $vpn_ip"; fi
+            dns_srv=$(grep 'DNS:' "$logfile" 2>/dev/null | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            if [[ -n "${dns_srv:-}" ]]; then echo "    DNS:       $dns_srv"; fi
+            started=$(grep 'Initialization Sequence Completed' "$logfile" 2>/dev/null | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1 || true)
+            if [[ -n "${started:-}" ]]; then echo "    Since:     $started"; fi
+        fi
+
+        if [[ -f "$logfile" ]]; then
+            last_connected=$(grep 'Initialization Sequence Completed' "$logfile" 2>/dev/null | tail -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' || true)
+            if [[ -z "$last_connected" ]]; then
+                last_connected=$(grep 'Initialization Sequence Completed' "$logfile" 2>/dev/null | tail -1 | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' || true)
+            fi
+            if [[ -n "$last_connected" && "$state" != "CONNECTED" ]]; then echo "    Last:      $last_connected"; fi
+        fi
+        echo ""
+        shown_names="$shown_names $tname"
+        found=true
+    done
+
+    # Also show any PID-tracked tunnels not in configs dir (connected via full path)
+    for pidfile in "$RUN_DIR"/*.pid; do
+        [[ -f "$pidfile" ]] || continue
+        name=$(basename "$pidfile" .pid)
+        case "$shown_names" in *" $name"*) continue ;; esac
+        if [[ -n "$filter" && "$name" != "$filter" ]]; then continue; fi
+
+        logfile=$(tunnel_log "$name")
+        state=$(tunnel_state "$logfile" "$pidfile")
+        pid=$(cat "$pidfile")
+        remote=$(grep -oE 'link remote: \[AF_INET\][^ ]+' "$logfile" 2>/dev/null | tail -1 | sed 's/link remote: \[AF_INET\]//' || true)
+
+        echo "[*] $name (no config in ~/.openvpn-sso/configs/)"
+        if [[ -n "${remote:-}" ]]; then echo "    Remote:    $remote"; fi
+        echo "    State:     $state"
+        echo "    PID:       $pid"
+        echo ""
+        found=true
+    done
+
+    # Orphan detection
+    known_pids=""
+    for pf in "$RUN_DIR"/*.pid; do
+        if [[ -f "$pf" ]]; then known_pids="$known_pids $(cat "$pf")"; fi
+    done
+    while IFS= read -r proc; do
+        if [[ -z "$proc" ]]; then continue; fi
+        orphan_pid=$(echo "$proc" | awk '{print $1}')
+        case "$known_pids" in
+            *" $orphan_pid"*) ;; # already tracked
+            *) echo "[*] ORPHAN: $proc"; found=true ;;
+        esac
+    done < <(pgrep -la openvpn 2>/dev/null || true)
+
+    if [[ "$found" == "false" ]]; then
+        echo "[*] No configs found. Copy .ovpn files to $CONFIGS_DIR"
+    fi
+    exit 0
+fi
+
+# ── Log (no root needed) ──
+if [[ "${1:-}" == "--log" ]]; then
+    shift
+    # Parse --tail [N] and --follow/-f
+    do_tail=false
+    do_follow=false
+    tail_lines=50
+    name=""
+    for arg in "$@"; do
+        case "$arg" in
+            --tail) do_tail=true ;;
+            --follow|-f) do_follow=true ;;
+            [0-9]*) tail_lines="$arg" ;;
+            *) name="$arg" ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        logfile=$(ls -t "$RUN_DIR"/*.log 2>/dev/null | head -1)
+        if [[ -z "${logfile:-}" ]]; then echo "[!] No logs."; exit 1; fi
+    else
+        logfile=$(tunnel_log "$name")
+    fi
+
+    if [[ ! -f "$logfile" ]]; then echo "[!] No log for '$name'."; exit 1; fi
+
+    echo "[*] $logfile"
+    if [[ "$do_follow" == "true" ]]; then
+        exec tail -f -n "$tail_lines" "$logfile"
+    elif [[ "$do_tail" == "true" ]]; then
+        tail -n "$tail_lines" "$logfile"
+    else
+        cat "$logfile"
+    fi
+    exit 0
+fi
+
+# ── Cleanup (needs sudo for kill/scutil) ──
+if [[ "${1:-}" == "--cleanup" || "${1:-}" == "--disconnect" || "${1:-}" == "-d" ]]; then
+    if [[ -n "${2:-}" ]]; then
+        name="$2"
+        echo "[*] Disconnecting: $name"
+        pidfile=$(tunnel_pid "$name")
+        if [[ -f "$pidfile" ]]; then
+            pid=$(cat "$pidfile")
+            sudo kill "$pid" 2>/dev/null && echo "    Killed PID $pid" || true
+            rm -f "$pidfile"
+        fi
+        # Kill orphan openvpn processes for this tunnel
+        while IFS= read -r orphan_pid; do
+            if [[ -z "$orphan_pid" ]]; then continue; fi
+            sudo kill "$orphan_pid" 2>/dev/null && echo "    Killed orphan PID $orphan_pid" || true
+        done < <(pgrep -f "openvpn.*${name}-cleaned" 2>/dev/null || true)
+        sudo scutil <<-EOF >/dev/null 2>&1
+			remove $(tunnel_dns_key "$name")
+			quit
+		EOF
+        rm -f "$(tunnel_config "$name")"
+    else
+        echo "[*] Cleaning up all VPN tunnels..."
+        for pidfile in "$RUN_DIR"/*.pid; do
+            [[ -f "$pidfile" ]] || continue
+            name=$(basename "$pidfile" .pid)
+            pid=$(cat "$pidfile")
+            sudo kill "$pid" 2>/dev/null && echo "[*] Killed $name (PID $pid)" || true
+            rm -f "$pidfile"
+            sudo scutil <<-EOF >/dev/null 2>&1
+				remove $(tunnel_dns_key "$name")
+				quit
+			EOF
+            rm -f "$(tunnel_config "$name")"
+        done
+        # Kill orphan openvpn processes associated with openvpn-sso (matching cleaned config pattern)
+        while IFS= read -r orphan_pid; do
+            if [[ -z "$orphan_pid" ]]; then continue; fi
+            sudo kill "$orphan_pid" 2>/dev/null && echo "[*] Killed orphan openvpn (PID $orphan_pid)" || true
+        done < <(pgrep -f "openvpn.*-cleaned\.ovpn" 2>/dev/null || true)
+        # Remove ALL VPN DNS keys
+        while IFS= read -r key; do
+            if [[ -z "$key" ]]; then continue; fi
+            key=$(echo "$key" | sed 's/^ *//')
+            sudo scutil <<< "remove $key" >/dev/null 2>&1
+        done < <(sudo scutil <<< "list" 2>/dev/null | grep -E '(VPN-|OpenVPN)' || true)
+    fi
+    sudo dscacheutil -flushcache 2>/dev/null
+    sudo killall -HUP mDNSResponder 2>/dev/null || true
+    echo "[*] Done."
+    exit 0
+fi
+
+# ── Catch unknown flags before entering connect flow ──
+# If first arg starts with - and isn't --config/--connect/-c/--fg/--foreground/--_root-connect,
+# it's an unknown command
+case "${1:-}" in
+    --config|--connect|-c|--fg|--foreground|--_root-connect|--log|"") ;; # known, proceed to connect
+    -*)
+        echo "openvpn-sso: unknown option '${1}'"
+        echo "Run 'openvpn-sso -h' for usage."
+        exit 1
+        ;;
+esac
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONNECT — needs root for openvpn, but browser opens as current user
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Ensure sudo access (prompt only if needed) ──
+if ! sudo -n true 2>/dev/null; then
+    sudo true || { echo "[!] sudo authentication failed."; exit 1; }
+fi
+
+# ── Parse arguments ──
+FOREGROUND=false
+OVPN_CONFIG=""
+OPENVPN_EXTRA_ARGS=()
+
+# Internal flag: --_root-connect means we're the elevated child process
+IS_ROOT_CHILD=false
+
+args=("$@")
+i=0
+while [[ $i -lt ${#args[@]} ]]; do
+    arg="${args[$i]}"
+    case "$arg" in
+        --fg|--foreground) FOREGROUND=true ;;
+        --_root-connect)   IS_ROOT_CHILD=true ;;
+        --config|--connect|-c) i=$((i + 1)); OVPN_CONFIG="${args[$i]}" ;;
+        *)                 OPENVPN_EXTRA_ARGS+=("$arg") ;;
+    esac
+    i=$((i + 1))
+done
+
+if [[ -z "$OVPN_CONFIG" ]]; then
+    echo "Error: --config <file.ovpn> is required. Run --help for usage."
+    exit 1
+fi
+
+# Resolve config path: short name → ~/.openvpn-sso/configs/<name>.ovpn → absolute path
+if [[ -f "$OVPN_CONFIG" ]]; then
+    # Direct path — resolve to absolute
+    if [[ "$OVPN_CONFIG" != /* ]]; then
+        OVPN_CONFIG="$(pwd)/$OVPN_CONFIG"
+    fi
+elif [[ -f "${OVPN_CONFIG}.ovpn" ]]; then
+    OVPN_CONFIG="$(pwd)/${OVPN_CONFIG}.ovpn"
+elif [[ -f "$CONFIGS_DIR/$OVPN_CONFIG" ]]; then
+    OVPN_CONFIG="$CONFIGS_DIR/$OVPN_CONFIG"
+elif [[ -f "$CONFIGS_DIR/${OVPN_CONFIG}.ovpn" ]]; then
+    OVPN_CONFIG="$CONFIGS_DIR/${OVPN_CONFIG}.ovpn"
+else
+    echo "Error: Config not found: $OVPN_CONFIG"
+    echo "    Searched: ./$OVPN_CONFIG, $CONFIGS_DIR/$OVPN_CONFIG"
+    echo "    Run 'openvpn-sso --list' to see available configs."
+    exit 1
+fi
+
+TUNNEL_NAME=$(tunnel_name_from_config "$OVPN_CONFIG")
+LOG_FILE=$(tunnel_log "$TUNNEL_NAME")
+PID_FILE=$(tunnel_pid "$TUNNEL_NAME")
+DNS_KEY=$(tunnel_dns_key "$TUNNEL_NAME")
+CLEANED_CONFIG=$(tunnel_config "$TUNNEL_NAME")
+BROWSER_URL_FILE="/tmp/openvpn-sso-browser-$TUNNEL_NAME"
+
+# ── Auto-cleanup all dead/disconnected tunnels before connecting ──
+for stale_pid in "$RUN_DIR"/*.pid; do
+    [[ -f "$stale_pid" ]] || continue
+    stale_name=$(basename "$stale_pid" .pid)
+    stale_log=$(tunnel_log "$stale_name")
+    stale_state=$(tunnel_state "$stale_log" "$stale_pid")
+    if [[ "$stale_state" == "DEAD" || "$stale_state" == "DISCONNECTED" ]]; then
+        echo "[*] Cleaning stale tunnel: $stale_name ($stale_state)"
+        sudo kill "$(cat "$stale_pid")" 2>/dev/null || true
+        rm -f "$stale_pid"
+        while IFS= read -r opid; do
+            if [[ -n "$opid" ]]; then sudo kill "$opid" 2>/dev/null || true; fi
+        done < <(pgrep -f "openvpn.*${stale_name}-cleaned" 2>/dev/null || true)
+        sudo scutil <<-EOFSC >/dev/null 2>&1
+			remove $(tunnel_dns_key "$stale_name")
+			quit
+		EOFSC
+        rm -f "$(tunnel_config "$stale_name")"
+    fi
+done
+sudo dscacheutil -flushcache 2>/dev/null
+sudo killall -HUP mDNSResponder 2>/dev/null || true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ROOT CHILD PROCESS — does the actual openvpn + DNS work
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ "$IS_ROOT_CHILD" == "true" ]]; then
+
+    tunnel_log_msg() {
+        local msg="[$(date '+%H:%M:%S')] $*"
+        echo "$msg" >> "$LOG_FILE"
+        if [[ "$FOREGROUND" == "true" ]]; then echo "$msg"; fi
+    }
+
+    setup_split_dns() {
+        tunnel_log_msg "[*] Configuring split-DNS..."
+        local dns_server="" dlist="" d
+        dns_server=$(grep 'PUSH_REPLY' "$LOG_FILE" 2>/dev/null | grep -oE 'dhcp-option DNS [^ ,"'\'']+' | head -1 | awk '{print $3}' || true)
+        dns_server="${dns_server%\'}"
+        if [[ -z "$dns_server" ]]; then tunnel_log_msg "[!] No DNS server."; return 1; fi
+        # Extract unique domains via sort -u (bash 3.x compatible)
+        dlist=$(grep 'PUSH_REPLY' "$LOG_FILE" 2>/dev/null | grep -oE 'dhcp-option DOMAIN [^ ,"'\'']+' | awk '{print $3}' | sed "s/'$//" | sort -u | tr '\n' ' ' || true)
+        if [[ -z "$dlist" ]]; then tunnel_log_msg "[!] No domains."; return 1; fi
+
+        tunnel_log_msg "[*] DNS: $dns_server domains: $dlist"
+
+        scutil <<-EOF
+			d.init
+			d.add ServerAddresses * ${dns_server}
+			d.add SupplementalMatchDomains * ${dlist}
+			set ${DNS_KEY}
+			quit
+		EOF
+        tunnel_log_msg "[*] Split-DNS configured."
+    }
+
+    # Clean config
+    if [[ ! -f "$OVPN_CONFIG" ]]; then
+        tunnel_log_msg "[!] Config file not found: $OVPN_CONFIG"
+        exit 1
+    fi
+    sed -e '/^push /d' -e '/^cipher /d' "$OVPN_CONFIG" > "$CLEANED_CONFIG"
+
+    tunnel_log_msg "[*] Starting OpenVPN [$TUNNEL_NAME]..."
+
+    openvpn \
+        --config "$CLEANED_CONFIG" \
+        --setenv IV_SSO webauth \
+        --pull-filter ignore "dhcp-option" \
+        --pull-filter ignore "register-dns" \
+        --pull-filter ignore "block-ipv6" \
+        --auth-retry interact \
+        --data-ciphers "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305" \
+        --sndbuf 524288 \
+        --rcvbuf 524288 \
+        --verb 3 \
+        ${OPENVPN_EXTRA_ARGS[@]+"${OPENVPN_EXTRA_ARGS[@]}"} \
+        >> "$LOG_FILE" 2>&1 &
+    ovpn_pid=$!
+    echo "$ovpn_pid" > "$PID_FILE"
+    tunnel_log_msg "[*] PID: $ovpn_pid"
+
+    browser_signaled=false
+    dns_configured=false
+
+    tail -f "$LOG_FILE" 2>/dev/null | while IFS= read -r line; do
+        if [[ "$FOREGROUND" == "true" ]]; then echo "  $line"; fi
+
+        # Signal browser open via file (user process will pick it up)
+        if [[ "$browser_signaled" == "false" ]] && echo "$line" | grep -q 'WEB_AUTH'; then
+            url=$(echo "$line" | sed "s/.*WEB_AUTH:://" | sed "s/'.*//")
+            if [[ -n "$url" ]]; then
+                echo "$url" > "$BROWSER_URL_FILE"
+                chmod 666 "$BROWSER_URL_FILE" 2>/dev/null || true
+                tunnel_log_msg "[*] SAML URL written to $BROWSER_URL_FILE"
+                browser_signaled=true
+            fi
+        fi
+
+        if [[ "$dns_configured" == "false" ]] && echo "$line" | grep -q 'Initialization Sequence Completed'; then
+            tunnel_log_msg "[*] Connected! [$TUNNEL_NAME]"
+            setup_split_dns
+            dns_configured=true
+            if [[ "$FOREGROUND" != "true" ]]; then break; fi
+        fi
+
+        echo "$line" | grep -q 'AUTH_FAILED' && tunnel_log_msg "[!] Auth failed."
+        kill -0 "$ovpn_pid" 2>/dev/null || { tunnel_log_msg "[!] OpenVPN exited."; rm -f "$PID_FILE"; break; }
+    done
+
+    if [[ "$FOREGROUND" == "true" ]]; then
+        wait "$ovpn_pid" 2>/dev/null || true
+        scutil <<-EOF >/dev/null 2>&1
+			remove $DNS_KEY
+			quit
+		EOF
+        dscacheutil -flushcache 2>/dev/null
+        killall -HUP mDNSResponder 2>/dev/null || true
+        rm -f "$PID_FILE" "$CLEANED_CONFIG" "$BROWSER_URL_FILE"
+        tunnel_log_msg "[*] Disconnected [$TUNNEL_NAME]."
+    fi
+    exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USER PROCESS — launches root child, handles browser, waits for connection
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "=== VPN [$TUNNEL_NAME] started $(date) ===" > "$LOG_FILE"
+: > "$BROWSER_URL_FILE" 2>/dev/null || true
+
+# Build args for the root child
+root_args=(--_root-connect --config "$OVPN_CONFIG")
+if [[ "$FOREGROUND" == "true" ]]; then root_args+=(--fg); fi
+if [[ ${#OPENVPN_EXTRA_ARGS[@]} -gt 0 ]]; then root_args+=("${OPENVPN_EXTRA_ARGS[@]}"); fi
+
+if [[ "$FOREGROUND" == "true" ]]; then
+    echo "[*] Connecting '$TUNNEL_NAME' (foreground)..."
+    sudo "$SCRIPT_PATH" "${root_args[@]}" &
+    ROOT_PID=$!
+
+    cleanup_fg() {
+        sudo kill "$ROOT_PID" 2>/dev/null || true
+        wait "$ROOT_PID" 2>/dev/null || true
+        : > "$BROWSER_URL_FILE" 2>/dev/null || true
+    }
+    trap cleanup_fg EXIT INT TERM
+
+    while kill -0 "$ROOT_PID" 2>/dev/null; do
+        if [[ -f "$BROWSER_URL_FILE" ]]; then
+            url=$(cat "$BROWSER_URL_FILE")
+            if [[ -n "$url" ]]; then
+                echo "[*] Opening browser for SAML auth..."
+                open "$url"
+                : > "$BROWSER_URL_FILE" 2>/dev/null || true
+            fi
+        fi
+        sleep 0.3
+    done
+    wait "$ROOT_PID" 2>/dev/null || true
+else
+    echo "[*] Connecting '$TUNNEL_NAME'..."
+    echo "[*] Log: $LOG_FILE"
+
+    sudo "$SCRIPT_PATH" "${root_args[@]}" &
+    ROOT_PID=$!
+
+    for i in $(seq 1 120); do
+        # Browser open
+        if [[ -f "$BROWSER_URL_FILE" ]]; then
+            url=$(cat "$BROWSER_URL_FILE")
+            if [[ -n "$url" ]]; then
+                echo "[*] Opening browser for SAML auth..."
+                open "$url"
+                : > "$BROWSER_URL_FILE" 2>/dev/null || true
+            fi
+        fi
+
+        # Check connection
+        if grep -q 'Initialization Sequence Completed' "$LOG_FILE" 2>/dev/null; then
+            echo "[*] Connected! Use: --status, --log $TUNNEL_NAME, --cleanup $TUNNEL_NAME"
+            : > "$BROWSER_URL_FILE" 2>/dev/null || true
+            exit 0
+        fi
+        if grep -q 'AUTH_FAILED' "$LOG_FILE" 2>/dev/null; then
+            echo "[!] Auth failed."; : > "$BROWSER_URL_FILE" 2>/dev/null || true; exit 1
+        fi
+        if ! kill -0 "$ROOT_PID" 2>/dev/null; then
+            echo "[!] OpenVPN exited. Check: $LOG_FILE"; : > "$BROWSER_URL_FILE" 2>/dev/null || true; exit 1
+        fi
+        sleep 1
+    done
+    echo "[!] Timeout. Check: $LOG_FILE"
+    : > "$BROWSER_URL_FILE" 2>/dev/null || true
+    exit 1
+fi
